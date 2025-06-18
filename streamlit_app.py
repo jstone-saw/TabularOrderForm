@@ -8,7 +8,33 @@ import os
 from io import BytesIO
 import re
 from datetime import datetime
-import pdfplumber
+
+# Try to import pdfplumber with error handling
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError as e:
+    PDFPLUMBER_AVAILABLE = False
+    st.error(f"❌ pdfplumber is not available: {str(e)}")
+    st.markdown("""
+    **To fix this issue:**
+    
+    1. **Check your requirements.txt** contains:
+       ```
+       pdfplumber==0.9.0
+       ```
+    
+    2. **For Streamlit Cloud:**
+       - Make sure the file is named exactly `requirements.txt`
+       - Commit and push changes to GitHub
+       - Redeploy the app (it may take a few minutes)
+    
+    3. **For local development:**
+       ```bash
+       pip install pdfplumber==0.9.0
+       ```
+    """)
+    st.stop()
 
 def extract_customer_info(text):
     """Extract customer information from PDF text"""
