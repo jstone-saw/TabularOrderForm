@@ -8,114 +8,108 @@ import os
 from io import BytesIO
 import re
 from datetime import datetime
+import pdfplumber
 
-# Check for Java and tabula-py
-try:
-    import tabula
-    TABULA_AVAILABLE = True
-except ImportError:
-    TABULA_AVAILABLE = False
-    st.error("❌ tabula-py is not available. Please check the installation.")
-
-# Check Java availability
-def check_java():
-    """Check if Java is available"""
-    try:
-        import subprocess
-        result = subprocess.run(['java', '-version'], capture_output=True, text=True)
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-def extract_customer_info(dfs):
-    """Extract customer information from the dataframes"""
+def extract_customer_info(text):
+    """Extract customer information from PDF text"""
     customer_name = "Not found"
     order_date = "Not found"
     
-    # Look through all dataframes for customer info
-    for df in dfs:
-        df_str = df.to_string()
-        
-        # Try to find customer name (common patterns)
-        customer_patterns = [
-            r'Customer[:\s]+([^\n\r]+)',
-            r'Bill[ing]*\s+To[:\s]+([^\n\r]+)',
-            r'Ship[ping]*\s+To[:\s]+([^\n\r]+)',
-            r'Name[:\s]+([^\n\r]+)',
-            r'Client[:\s]+([^\n\r]+)',
-        ]
-        
-        for pattern in customer_patterns:
-            match = re.search(pattern, df_str, re.IGNORECASE)
-            if match and customer_name == "Not found":
-                customer_name = match.group(1).strip()
-                break
-        
-        # Try to find date (common patterns)
-        date_patterns = [
-            r'Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-            r'Order\s+Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-            r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-        ]
-        
-        for pattern in date_patterns:
-            match = re.search(pattern, df_str, re.IGNORECASE)
-            if match and order_date == "Not found":
-                order_date = match.group(1).strip()
-                break
+    # Try to find customer name (common patterns)
+    customer_patterns = [
+        r'Customer[:\s]+([^\n\r]+)',
+        r'Bill[ing]*\s+To[:\s]+([^\n\r]+)',
+        r'Ship[ping]*\s+To[:\s]+([^\n\r]+)',
+        r'Name[:\s]+([^\n\r]+)',
+        r'Client[:\s]+([^\n\r]+)',
+        r'Delivery[:\s]+([^\n\r]+)',
+    ]
+    
+    for pattern in customer_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match and customer_name == "Not found":
+            customer_name = match.group(1).strip()
+            # Clean up common artifacts
+            customer_name = re.sub(r'[:\s]+$', '', customer_name)
+            break
+    
+    # Try to find date (common patterns)
+    date_patterns = [
+        r'Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'Order\s+Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'Invoice\s+Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match and order_date == "Not found":
+            order_date = match.group(1).strip()
+            break
     
     return customer_name, order_date
 
-def process_line_items(dfs):
-    """Process and combine line items from all dataframes"""
+def extract_tables_from_pdf(pdf_path):
+    """Extract tables from PDF using pdfplumber"""
+    tables = []
+    all_text = ""
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            # Extract text for customer info
+            page_text = page.extract_text()
+            if page_text:
+                all_text += page_text + "\n"
+            
+            # Extract tables
+            page_tables = page.extract_tables()
+            for table_num, table in enumerate(page_tables):
+                if table and len(table) > 1:  # Skip empty or single-row tables
+                    # Convert to DataFrame
+                    headers = table[0] if table[0] else [f"Column_{i}" for i in range(len(table[0]) if table else 0)]
+                    data = table[1:] if len(table) > 1 else []
+                    
+                    if data:
+                        df = pd.DataFrame(data, columns=headers)
+                        # Clean up the dataframe
+                        df = df.dropna(how='all')  # Remove completely empty rows
+                        df = df.loc[:, ~df.columns.duplicated()]  # Remove duplicate columns
+                        
+                        # Add metadata
+                        df['_page'] = page_num + 1
+                        df['_table'] = table_num + 1
+                        
+                        tables.append(df)
+    
+    return tables, all_text
+
+def process_line_items(tables):
+    """Process and combine line items from all tables"""
+    if not tables:
+        return pd.DataFrame()
+    
     all_items = []
     
-    for i, df in enumerate(dfs):
-        # Skip very small dataframes (likely headers or footers)
+    for i, df in enumerate(tables):
+        # Skip very small tables (likely headers or footers)
         if len(df) < 2:
             continue
-            
-        # Try to identify columns that might contain product info
-        df_copy = df.copy()
         
         # Clean up the dataframe
+        df_copy = df.copy()
         df_copy = df_copy.dropna(how='all')  # Remove completely empty rows
         
-        # Try to identify key columns
-        potential_product_cols = []
-        potential_qty_cols = []
-        potential_price_cols = []
-        
-        for col in df_copy.columns:
-            col_str = str(col).lower()
-            col_data = df_copy[col].astype(str).str.lower()
-            
-            # Product/Description columns
-            if any(keyword in col_str for keyword in ['product', 'item', 'description', 'name']):
-                potential_product_cols.append(col)
-            
-            # Quantity columns
-            if any(keyword in col_str for keyword in ['qty', 'quantity', 'units', 'count']):
-                potential_qty_cols.append(col)
-            elif col_data.str.match(r'^\d+$').sum() > len(df_copy) * 0.5:  # Mostly numbers
-                potential_qty_cols.append(col)
-            
-            # Price columns
-            if any(keyword in col_str for keyword in ['price', 'cost', 'amount', 'total', '$']):
-                potential_price_cols.append(col)
-            elif col_data.str.contains(r'[\$£€]|\d+\.\d{2}').sum() > 0:
-                potential_price_cols.append(col)
-        
-        # Add rows to items list
+        # Add source information
         for idx, row in df_copy.iterrows():
             item_data = {
-                'Table_Source': f'Table_{i+1}',
+                'Table_Source': f'Page_{row.get("_page", "Unknown")}_Table_{row.get("_table", i+1)}',
                 'Row_Index': idx
             }
             
-            # Add all columns
+            # Add all columns (except metadata)
             for col in df_copy.columns:
-                item_data[str(col)] = row[col]
+                if not col.startswith('_'):
+                    item_data[str(col)] = row[col]
             
             all_items.append(item_data)
     
@@ -138,10 +132,13 @@ def calculate_summary_stats(items_df):
     # Try to find quantity columns and sum them
     for col in items_df.columns:
         col_str = str(col).lower()
-        if any(keyword in col_str for keyword in ['qty', 'quantity', 'units', 'count']):
+        if any(keyword in col_str for keyword in ['qty', 'quantity', 'units', 'count', 'qnty']):
             try:
                 # Clean and convert to numeric
-                numeric_values = pd.to_numeric(items_df[col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce')
+                numeric_values = pd.to_numeric(
+                    items_df[col].astype(str).str.replace(r'[^\d.]', '', regex=True), 
+                    errors='coerce'
+                )
                 total_quantity += numeric_values.sum()
                 break
             except:
@@ -151,33 +148,7 @@ def calculate_summary_stats(items_df):
 
 def main():
     st.title("📋 Order PDF Processor")
-    st.markdown("Extract order summaries and line items from PDF files")
-    
-    # Check dependencies
-    if not TABULA_AVAILABLE:
-        st.error("❌ **Missing Dependencies**")
-        st.markdown("""
-        This app requires `tabula-py` and Java to be installed. 
-        
-        **For Streamlit Cloud deployment:**
-        1. Ensure `tabula-py==2.9.0` is in your `requirements.txt`
-        2. Add `default-jre` and `default-jdk` to your `packages.txt`
-        3. Redeploy the app
-        
-        **For local development:**
-        ```bash
-        pip install tabula-py==2.9.0
-        # Install Java JRE/JDK on your system
-        ```
-        """)
-        return
-    
-    if not check_java():
-        st.warning("⚠️ **Java Runtime Not Detected**")
-        st.markdown("""
-        Java is required for PDF processing but wasn't detected. 
-        The app may not work properly without Java.
-        """)
+    st.markdown("Extract order summaries and line items from PDF files using pdfplumber")
     
     # File upload
     uploaded_file = st.file_uploader(
@@ -197,134 +168,134 @@ def main():
             
             # Extraction options
             st.sidebar.header("⚙️ Extraction Options")
-            pages_param = st.sidebar.selectbox(
-                "Pages to process",
-                ["All pages", "First page only", "Custom"],
-                help="Most order info is on the first page"
+            
+            extract_all_pages = st.sidebar.checkbox(
+                "Extract from all pages", 
+                value=True,
+                help="Uncheck to process only the first page"
             )
             
-            if pages_param == "Custom":
-                page_input = st.sidebar.text_input("Page numbers (e.g., 1,2 or 1-3)", value="1")
-                pages_param = page_input if page_input else "1"
-            elif pages_param == "First page only":
-                pages_param = 1
-            else:
-                pages_param = "all"
-            
-            use_stream = st.sidebar.checkbox("Use stream mode", value=True)
+            show_debug = st.sidebar.checkbox(
+                "Show debug information", 
+                value=False,
+                help="Display raw extracted text and tables for debugging"
+            )
             
             # Process PDF button
             if st.button("🚀 Process Order PDF", type="primary"):
                 with st.spinner("Processing order PDF..."):
                     try:
-                        # Extract tables
-                        dfs = tabula.read_pdf(
-                            tmp_file_path,
-                            pages=pages_param,
-                            stream=use_stream,
-                            multiple_tables=True
-                        )
+                        # Extract tables and text from PDF
+                        tables, full_text = extract_tables_from_pdf(tmp_file_path)
                         
-                        if dfs and len(dfs) > 0:
-                            # Extract customer information
-                            customer_name, order_date = extract_customer_info(dfs)
+                        if show_debug:
+                            with st.expander("🔍 Debug: Raw Extracted Text"):
+                                st.text_area("Full PDF Text", full_text, height=200)
+                        
+                        # Extract customer information from text
+                        customer_name, order_date = extract_customer_info(full_text)
+                        
+                        # Process line items
+                        items_df = process_line_items(tables)
+                        
+                        # Calculate summary stats
+                        total_products, total_quantity = calculate_summary_stats(items_df)
+                        
+                        # Display Order Summary
+                        st.header("📊 Order Summary")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("👤 Customer Name", customer_name)
+                            st.metric("📅 Order Date", order_date)
+                        
+                        with col2:
+                            st.metric("📦 Total Products Ordered", total_products)
+                            st.metric("🔢 Total Quantity Ordered", total_quantity)
+                        
+                        # Create summary dataframe for download
+                        summary_data = {
+                            'Customer Name': [customer_name],
+                            'Date': [order_date],
+                            'Total Products Ordered': [total_products],
+                            'Total Quantity Ordered': [total_quantity]
+                        }
+                        summary_df = pd.DataFrame(summary_data)
+                        
+                        st.divider()
+                        
+                        # Display Line Items
+                        st.header("📋 Order Line Items")
+                        
+                        if not items_df.empty:
+                            st.dataframe(items_df, use_container_width=True)
                             
-                            # Process line items
-                            items_df = process_line_items(dfs)
+                            # Download section
+                            st.divider()
+                            st.header("📥 Download Options")
                             
-                            # Calculate summary stats
-                            total_products, total_quantity = calculate_summary_stats(items_df)
+                            col1, col2, col3 = st.columns(3)
                             
-                            # Display Order Summary
-                            st.header("📊 Order Summary")
-                            
-                            col1, col2 = st.columns(2)
                             with col1:
-                                st.metric("👤 Customer Name", customer_name)
-                                st.metric("📅 Order Date", order_date)
+                                # Download summary as CSV
+                                summary_csv = summary_df.to_csv(index=False)
+                                st.download_button(
+                                    label="📊 Download Summary (CSV)",
+                                    data=summary_csv,
+                                    file_name=f"order_summary_{uploaded_file.name.replace('.pdf', '')}.csv",
+                                    mime="text/csv"
+                                )
                             
                             with col2:
-                                st.metric("📦 Total Products Ordered", total_products)
-                                st.metric("🔢 Total Quantity Ordered", total_quantity)
+                                # Download line items as CSV
+                                items_csv = items_df.to_csv(index=False)
+                                st.download_button(
+                                    label="📋 Download Line Items (CSV)",
+                                    data=items_csv,
+                                    file_name=f"line_items_{uploaded_file.name.replace('.pdf', '')}.csv",
+                                    mime="text/csv"
+                                )
                             
-                            # Create summary dataframe for download
-                            summary_data = {
-                                'Customer Name': [customer_name],
-                                'Date': [order_date],
-                                'Total Products Ordered': [total_products],
-                                'Total Quantity Ordered': [total_quantity]
-                            }
-                            summary_df = pd.DataFrame(summary_data)
-                            
-                            st.divider()
-                            
-                            # Display Line Items
-                            st.header("📋 Order Line Items")
-                            
-                            if not items_df.empty:
-                                st.dataframe(items_df, use_container_width=True)
+                            with col3:
+                                # Download combined Excel file
+                                excel_buffer = BytesIO()
+                                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                    summary_df.to_excel(writer, sheet_name='Order_Summary', index=False)
+                                    items_df.to_excel(writer, sheet_name='Line_Items', index=False)
                                 
-                                # Download section
-                                st.divider()
-                                st.header("📥 Download Options")
-                                
-                                col1, col2, col3 = st.columns(3)
-                                
-                                with col1:
-                                    # Download summary as CSV
-                                    summary_csv = summary_df.to_csv(index=False)
-                                    st.download_button(
-                                        label="📊 Download Summary (CSV)",
-                                        data=summary_csv,
-                                        file_name=f"order_summary_{uploaded_file.name.replace('.pdf', '')}.csv",
-                                        mime="text/csv"
-                                    )
-                                
-                                with col2:
-                                    # Download line items as CSV
-                                    items_csv = items_df.to_csv(index=False)
-                                    st.download_button(
-                                        label="📋 Download Line Items (CSV)",
-                                        data=items_csv,
-                                        file_name=f"line_items_{uploaded_file.name.replace('.pdf', '')}.csv",
-                                        mime="text/csv"
-                                    )
-                                
-                                with col3:
-                                    # Download combined Excel file
-                                    excel_buffer = BytesIO()
-                                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                                        summary_df.to_excel(writer, sheet_name='Order_Summary', index=False)
-                                        items_df.to_excel(writer, sheet_name='Line_Items', index=False)
-                                    
-                                    st.download_button(
-                                        label="📊 Download Complete Report (Excel)",
-                                        data=excel_buffer.getvalue(),
-                                        file_name=f"order_report_{uploaded_file.name.replace('.pdf', '')}.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                    )
-                            
-                            else:
-                                st.warning("⚠️ No line items found. The PDF structure might not be recognized.")
-                                
-                                # Show raw extracted tables for debugging
-                                with st.expander("🔍 View Raw Extracted Tables"):
-                                    for i, df in enumerate(dfs):
-                                        st.subheader(f"Raw Table {i+1}")
-                                        st.dataframe(df)
+                                st.download_button(
+                                    label="📊 Download Complete Report (Excel)",
+                                    data=excel_buffer.getvalue(),
+                                    file_name=f"order_report_{uploaded_file.name.replace('.pdf', '')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
                         
                         else:
-                            st.error("❌ No tables found in the PDF.")
-                            st.info("💡 Try adjusting the extraction options or check if the PDF contains extractable tables.")
+                            st.warning("⚠️ No line items found. The PDF structure might not contain recognizable tables.")
+                            
+                            # Show raw extracted tables for debugging
+                            if tables:
+                                with st.expander("🔍 View Raw Extracted Tables"):
+                                    for i, df in enumerate(tables):
+                                        st.subheader(f"Raw Table {i+1}")
+                                        st.dataframe(df)
+                            else:
+                                st.info("💡 No tables were detected in the PDF. This might be a text-only document or the tables might be formatted as images.")
+                        
+                        if show_debug and tables:
+                            with st.expander("🔍 Debug: All Extracted Tables"):
+                                for i, df in enumerate(tables):
+                                    st.subheader(f"Table {i+1}")
+                                    st.dataframe(df)
                     
                     except Exception as e:
                         st.error(f"❌ Error processing PDF: {str(e)}")
                         st.info("💡 Tips:")
                         st.markdown("""
-                        - Ensure the PDF contains actual tables (not images)
-                        - Try toggling the 'Use stream mode' option
+                        - Ensure the PDF contains actual tables (not images of tables)
                         - Check if the PDF is text-based and not scanned
-                        - Some PDFs may require manual review of the structure
+                        - Try enabling debug mode to see what was extracted
+                        - Some PDFs may have complex layouts that are difficult to parse
                         """)
         
         finally:
@@ -337,7 +308,7 @@ def main():
         
         st.markdown("""
         ### 📋 What this app does:
-        1. **Extracts order information** from PDF files
+        1. **Extracts order information** from PDF files using pdfplumber
         2. **Creates a summary** with Customer Name, Date, Total Products, Total Quantity
         3. **Displays line items** in a detailed table
         4. **Provides downloads** in CSV and Excel formats
@@ -356,9 +327,17 @@ def main():
         - Includes source table information
         
         ### 💡 Best Results:
-        - PDFs with clear table structures work best
-        - Text-based PDFs (not scanned images)
-        - Standard invoice/order formats
+        - **Text-based PDFs** work better than scanned images
+        - **Standard invoice/order formats** are recognized more easily
+        - **Clear table structures** improve extraction accuracy
+        - Use debug mode to see what text and tables are being extracted
+        
+        ### 🔧 Technology:
+        This app uses **pdfplumber** instead of tabula-py, which:
+        - Works reliably on cloud platforms
+        - Doesn't require Java installation
+        - Handles both text and table extraction
+        - Provides better debugging capabilities
         """)
 
 if __name__ == "__main__":
